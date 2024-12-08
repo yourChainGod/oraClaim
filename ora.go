@@ -24,7 +24,22 @@ var (
 	receiveAddress string
 	successMutex   sync.Mutex
 	failureMutex   sync.Mutex
+	successMap     sync.Map // 用于存储已成功的地址
 )
+
+func init() {
+	// 读取已成功的地址
+	if content, err := os.ReadFile("领取成功.txt"); err == nil {
+		for _, line := range strings.Split(string(content), "\n") {
+			if line = strings.TrimSpace(line); line != "" {
+				parts := strings.Split(line, "----")
+				if len(parts) > 0 {
+					successMap.Store(strings.ToLower(parts[0]), true)
+				}
+			}
+		}
+	}
+}
 
 func writeToFile(filename string, content string, mutex *sync.Mutex) {
 	mutex.Lock()
@@ -149,17 +164,22 @@ func initLogger() *log.Logger {
 }
 
 func doTask(privateKeyStr string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("任务异常", "错误", r)
+		}
+	}()
+
 	privateKey, err := crypto.HexToECDSA(privateKeyStr)
 	if err != nil {
-		logger.Error("私钥转换错误", err)
-		recordFailure("12345", privateKeyStr, "私钥转换错误")
+		recordFailure("未知", privateKeyStr, "私钥转换错误")
 		return
 	}
+
 	publicKey := privateKey.Public()
 	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
 	if !ok {
-		logger.Error("公钥转换错误")
-		recordFailure("12345", privateKeyStr, "公钥转换错误")
+		recordFailure("未知", privateKeyStr, "公钥转换错误")
 		return
 	}
 	address := crypto.PubkeyToAddress(*publicKeyECDSA).Hex()
@@ -360,11 +380,14 @@ func main() {
 		if line == "" {
 			continue
 		}
+		if !strings.Contains(line, "----") {
+			continue
+		}
 		validLines = append(validLines, line)
 	}
 
 	// 创建并发控制channel
-	sem := make(chan struct{}, 10) // 限制5个并发
+	sem := make(chan struct{}, 10) // 限制10个并发
 	var wg sync.WaitGroup
 
 	// 处理每一行
@@ -377,13 +400,17 @@ func main() {
 		}
 		privateKey := strings.TrimSpace(parts[1])
 		address := parts[0]
+		// 检查地址是否已经成功
+		if _, exists := successMap.Load(strings.ToLower(address)); exists {
+			logger.Info("跳过已成功地址", "地址", address)
+			continue
+		}
 
 		wg.Add(1)
 		go func(pk, addr string) {
 			defer wg.Done()
 			sem <- struct{}{}        // 获取信号量
 			defer func() { <-sem }() // 释放信号量
-
 			logger.Info("开始处理私钥", "地址", addr)
 			doTask(pk)
 			time.Sleep(time.Second * 2)
